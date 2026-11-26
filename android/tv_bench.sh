@@ -69,7 +69,9 @@ Usage: $(basename "$0") [options]
 Guided by default when stdin is a terminal: checklist, connect, settings
 check, smoke test, then the full run. --yes runs unattended.
 
-  -s SERIAL            adb serial, e.g. HOST:5555 (adb connect is done for you)
+  --target NAME        use config/targets/NAME.env (VC1_TARGETS_DIR overrides the directory);
+                       command-line options override its fields; NO_WAKE=1 there implies --no-wake
+  -s SERIAL            ad hoc adb target, e.g. HOST:5555 (adb connect is done for you)
   --yes                no prompts (unattended)
   --smoke              run only the smoke test (the "smoke" clip, both variants, threads 1 and 4)
   --no-smoke           skip the smoke test
@@ -111,37 +113,71 @@ EOF
 # ---------------------------------------------------------------------------
 # Options
 
+# load_target NAME: read config/targets/NAME.env (VC1_TARGETS_DIR overrides the
+# directory) into T_* variables. Fields: TYPE (adb|local), ARCH, BUILD, NOTES,
+# SERIAL, DEV_DIR, WORK_DIR, BIN_DIR, NO_WAKE, NO_SMOKE, COOLDOWN, TIMEOUT,
+# RECONNECT_TRIES, VARIANTS. Command-line options override them.
+load_target() {
+    local f=${VC1_TARGETS_DIR:-$HERE/../config/targets}/$1.env k
+    if [ ! -f "$f" ]; then
+        echo "no target '$1': $f is missing" >&2
+        echo "  copy config/targets/<type>.env.example to $f and edit it" >&2
+        exit 2
+    fi
+    for k in TYPE ARCH BUILD NOTES SERIAL DEV_DIR WORK_DIR BIN_DIR NO_WAKE NO_SMOKE COOLDOWN TIMEOUT RECONNECT_TRIES VARIANTS; do unset "$k"; done
+    # shellcheck disable=SC1090
+    . "$f"
+    T_TYPE=${TYPE:-adb} T_ARCH=${ARCH:-} T_BUILD=${BUILD:-} T_NOTES=${NOTES:-}
+    T_SERIAL=${SERIAL:-} T_DEV_DIR=${DEV_DIR:-} T_WORK_DIR=${WORK_DIR:-} T_BIN_DIR=${BIN_DIR:-}
+    T_NO_WAKE=${NO_WAKE:-} T_NO_SMOKE=${NO_SMOKE:-} T_COOLDOWN=${COOLDOWN:-}
+    T_TIMEOUT=${TIMEOUT:-} T_RECONNECT_TRIES=${RECONNECT_TRIES:-} T_VARIANTS=${VARIANTS:-}
+    [ -f "$HERE/../lib/target-$T_TYPE.sh" ] || {
+        echo "$f: unknown TYPE '$T_TYPE' (no lib/target-$T_TYPE.sh)" >&2; exit 2; }
+    for k in TYPE ARCH BUILD NOTES SERIAL DEV_DIR WORK_DIR BIN_DIR NO_WAKE NO_SMOKE COOLDOWN TIMEOUT RECONNECT_TRIES VARIANTS; do unset "$k"; done
+}
+
 parse_args() {
     ORIG_ARGS=
     [ $# -gt 0 ] && ORIG_ARGS=$(printf "'%s' " "$@")
-    SERIAL=
+    # Target file first (so that command-line options can override its fields).
+    TARGET_NAME=
+    T_TYPE=adb T_ARCH= T_BUILD= T_NOTES= T_SERIAL= T_DEV_DIR= T_WORK_DIR= T_BIN_DIR=
+    T_NO_WAKE= T_NO_SMOKE= T_COOLDOWN= T_TIMEOUT= T_RECONNECT_TRIES= T_VARIANTS=
+    local prev=
+    for a in "$@"; do
+        [ "$prev" = --target ] && TARGET_NAME=$a
+        prev=$a
+    done
+    [ -n "$TARGET_NAME" ] && load_target "$TARGET_NAME"
+    SERIAL=$T_SERIAL
     CLIPS_ARG=
     BENCH_THREADS=
     VERIFY_THREADS=
     RUNS=
     MAX_FRAMES=0
-    VARIANTS=${DEFAULT_VARIANTS:-"$BASE_VARIANT $THREADED_VARIANT"}
+    VARIANTS=${T_VARIANTS:-${DEFAULT_VARIANTS:-"$BASE_VARIANT $THREADED_VARIANT"}}
     ABI=
     ABI_FORCED=0
     DO_VERIFY=1
     DO_BENCH=1
-    COOLDOWN=10
-    TIMEOUT=1800
-    RECONNECT_TRIES=6
+    COOLDOWN=${T_COOLDOWN:-10}
+    TIMEOUT=${T_TIMEOUT:-1800}
+    RECONNECT_TRIES=${T_RECONNECT_TRIES:-6}
     SLOWDOWN=
     OUT=
     RESUME=0
     FORCE=0
     DRY=0
     LOCAL=0
+    TARGET_TYPE=$T_TYPE
     YES=0
     SMOKE_ONLY=0
-    NO_SMOKE=0
+    NO_SMOKE=${T_NO_SMOKE:-0}
     QUICK=0
     CONTENTION=0
     KEEP_CLIPS=1
     CLEAR_CLIPS=0
-    NO_WAKE=0
+    NO_WAKE=${T_NO_WAKE:-0}   # NO_WAKE=1 in a target file makes --no-wake implicit
     RESTORE_FILE=
 
     while [ $# -gt 0 ]; do
@@ -172,7 +208,8 @@ parse_args() {
         --force) FORCE=1 ;;
         --restore-settings) RESTORE_FILE=$2; shift ;;
         --dry-run) DRY=1 ;;
-        --local) LOCAL=1 ;;
+        --target) shift ;;   # handled above
+        --local) LOCAL=1; TARGET_TYPE=local ;;
         --no-wake) NO_WAKE=1 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -201,11 +238,9 @@ parse_args() {
     [ -t 0 ] && [ $YES = 0 ] && [ $DRY = 0 ] && INTERACTIVE=1
 
     # Target implementation: transport and device operations live in lib/.
-    if [ $LOCAL = 1 ]; then
-        . "$HERE/../lib/target-local.sh"
-    else
-        . "$HERE/../lib/target-adb.sh"
-    fi
+    # shellcheck disable=SC1090
+    . "$HERE/../lib/target-$TARGET_TYPE.sh"
+    [ -n "$T_BIN_DIR" ] && [ -z "${VC1_BIN:-}" ] && BIN=$T_BIN_DIR
     target_init
     JOB_DIR=$DEV_DIR/jobs
     CLIP_DIR=$DEV_DIR/clips
@@ -921,7 +956,7 @@ preflight() {
         *,macos,*) ABI=macos ;;
         *,arm64-v8a,*) ABI=arm64-v8a ;;
         *,armeabi-v7a,*) ABI=armeabi-v7a ;;
-        ,,) ABI=armeabi-v7a; log "abilist unknown (dry run), assuming $ABI" ;;
+        ,,) ABI=${T_ARCH:-armeabi-v7a}; log "abilist unknown (dry run), assuming $ABI" ;;
         *) die "no supported ABI in abilist '$ABILIST'" ;;
         esac
     fi
@@ -941,6 +976,7 @@ preflight() {
     RUNLOG=$OUT/run.log
     ADBLOG=$OUT/logs/adb.log
     log "results: $OUT"
+    [ -n "$TARGET_NAME" ] && log "target: $TARGET_NAME ($TARGET_TYPE)${T_NOTES:+ - $T_NOTES}"
     log "model: $MODEL  abilist: $ABILIST  abi: $ABI  device dir: $DEV_DIR"
     if [ "$MAX_FRAMES" -gt 0 ]; then log "max-frames: first $MAX_FRAMES frames of each clip"; fi
 
@@ -996,7 +1032,7 @@ preflight() {
 
 push_binaries() {
     for v in $VARIANTS; do
-        [ -x "$BIN/ffmpeg-$v-$ABI" ] || die "missing binary $BIN/ffmpeg-$v-$ABI (run build_android.sh)"
+        [ -x "$BIN/ffmpeg-$v-$ABI" ] || die "missing binary $BIN/ffmpeg-$v-$ABI (${T_BUILD:+build it with $T_BUILD <worktree> $v; or }run build_android.sh)"
         dpush "$BIN/ffmpeg-$v-$ABI" "$DEV_DIR/ffmpeg-$v" || die_lost "pushing ffmpeg-$v"
         dsh "chmod 755 $DEV_DIR/ffmpeg-$v" > /dev/null
         ver=$(dsh "$DEV_DIR/ffmpeg-$v -hide_banner -version 2>&1 | head -1")
