@@ -1,0 +1,22 @@
+# ffmpeg ./configure flags shared by every build/*.sh (all architectures).
+# Copy to config/configure-flags and edit; the copy is git-ignored.
+# Whitespace separated, may span lines, '#' starts a comment.
+# VC1_CONFIGURE_FLAGS points at another file. Architecture-specific flags
+# (cross prefix, sysroot, cpu) are added by each build script after these.
+#
+# This default builds a reduced, static ffmpeg CLI for decoding VC-1/WMV3 clips
+# to framemd5 or null. To benchmark another codec, change the decoder, parser
+# and demuxer lines.
+
+--disable-doc --disable-debug --disable-ffplay --disable-ffprobe
+--disable-network --disable-autodetect --disable-everything
+--enable-pic --disable-shared --enable-static
+
+# codec under test
+--enable-decoder=vc1,wmv3 --enable-parser=vc1
+
+# containers, output and the filters the CLI needs
+--enable-demuxer=mpegts,matroska,vc1 --enable-muxer=null,framemd5
+--enable-encoder=rawvideo,wrapped_avframe --enable-protocol=file,pipe
+--enable-filter=null,format,buffer,buffersink,scale
+--enable-bsf=extract_extradata --enable-swscale --enable-pthreads
