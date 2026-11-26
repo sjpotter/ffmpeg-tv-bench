@@ -1,0 +1,98 @@
+#!/bin/bash
+# Fake adb for testing tv_bench.sh's adb path on the Mac.
+#
+# /data/local/tmp maps to $FAKE_ADB_ROOT (also inside pushed *.sh files).
+# State lives in $FAKE_ADB_ROOT/.fake:
+#   FAKE_ABILIST            ro.product.cpu.abilist (default armeabi-v7a,armeabi)
+#   FAKE_UNAUTH_POLLS=N     report 'unauthorized' for the first N state queries
+#   FAKE_DROP_AT=N          go offline at the Nth shell call...
+#   FAKE_DROP_SECS=S        ...and refuse to reconnect for S seconds (default 10)
+#   FAKE_STUCK_KEYS='ns:key ...'  settings whose 'put' is ignored
+ROOT=${FAKE_ADB_ROOT:?}
+F=$ROOT/.fake
+mkdir -p "$ROOT" "$F/settings"
+SER=${FAKE_SERIAL:-fakehost:5555}
+[ "$1" = -s ] && { SER=$2; shift 2; }
+cmd=$1; shift
+
+count() { n=$(cat "$F/$1" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$F/$1"; echo $n; }
+
+state() {
+    if [ -f "$F/offline_until" ]; then
+        [ "$(date +%s)" -lt "$(cat "$F/offline_until")" ] && { echo offline; return; }
+        [ -f "$F/reconnected" ] || { echo offline; return; }
+        rm -f "$F/offline_until" "$F/reconnected"
+    fi
+    if [ -n "${FAKE_UNAUTH_POLLS:-}" ] && [ "$(count unauth)" -le "$FAKE_UNAUTH_POLLS" ]; then
+        echo unauthorized; return
+    fi
+    echo device
+}
+
+case $cmd in
+devices)
+    echo "List of devices attached"
+    printf '%s\t%s\n' "$SER" "$(state)" ;;
+get-state)
+    s=$(state); [ "$s" = device ] && echo device || { echo "error: device $s" >&2; exit 1; } ;;
+connect)
+    echo "connect $1" >> "$F/connects"
+    if [ -f "$F/offline_until" ] && [ "$(date +%s)" -lt "$(cat "$F/offline_until")" ]; then
+        echo "failed to connect to $1"; exit 1
+    fi
+    touch "$F/reconnected"
+    echo "connected to $1" ;;
+disconnect) echo "disconnected $1" ;;
+shell)
+    [ "$(state)" = device ] || { echo "error: closed" >&2; exit 1; }
+    n=$(count shell_calls)
+    if [ -n "${FAKE_DROP_AT:-}" ] && [ "$n" -eq "$FAKE_DROP_AT" ]; then
+        echo $(( $(date +%s) + ${FAKE_DROP_SECS:-10} )) > "$F/offline_until"
+        echo "fake: dropping the connection" >> "$F/events"
+        echo "error: closed" >&2; exit 1
+    fi
+    c=${1//\/data\/local\/tmp/$ROOT}
+    getprop() {
+        case $1 in
+        ro.product.model) echo "FAKE TV MODEL" ;;
+        ro.product.manufacturer) echo Fake ;;
+        ro.product.cpu.abilist) echo "${FAKE_ABILIST:-armeabi-v7a,armeabi}" ;;
+        ro.build.version.release) echo 8.0.0 ;;
+        ro.build.version.sdk) echo 26 ;;
+        *) echo "" ;;
+        esac
+    }
+    settings() {
+        local op=$1 ns=$2 key=$3 val=${4:-} f="$F/settings/$2.$3"
+        case $op in
+        get) cat "$f" 2>/dev/null || echo null ;;
+        put) case " ${FAKE_STUCK_KEYS:-} " in *" $ns:$key "*) ;; *) echo "$val" > "$f" ;; esac ;;
+        delete) rm -f "$f" ;;
+        esac
+    }
+    svc() { [ "$1 $2" = "power stayon" ] && settings put global stay_on_while_plugged_in 7; }
+    dumpsys() {
+        case "$1 ${2:-}" in
+        "deviceidle enabled") cat "$F/settings/idle.${3:-deep}" 2>/dev/null || echo 1 ;;
+        "deviceidle enable") for m in ${3:-deep light}; do echo 1 > "$F/settings/idle.$m"; done; echo "idle enabled" ;;
+        "deviceidle disable") for m in ${3:-deep light}; do echo 0 > "$F/settings/idle.$m"; done; echo "idle disabled" ;;
+        "power "*) echo "  mWakefulness=Awake"; echo "Display Power: state=ON" ;;
+        esac
+    }
+    input() { echo "$*" >> "$F/keyevents"; }
+    nproc() { echo 4; }
+    export -f getprop settings svc dumpsys input nproc
+    export F FAKE_ABILIST FAKE_STUCK_KEYS
+    bash -c "$c" ;;
+push)
+    [ "$(state)" = device ] || { echo "error: closed" >&2; exit 1; }
+    dst=${2//\/data\/local\/tmp/$ROOT}
+    case $1 in
+    *.sh) sed "s#/data/local/tmp#$ROOT#g" "$1" > "$dst" ;;
+    *) cp "$1" "$dst" ;;
+    esac ;;
+pull)
+    [ "$(state)" = device ] || { echo "error: closed" >&2; exit 1; }
+    cp "${1//\/data\/local\/tmp/$ROOT}" "$2" ;;
+*) echo "fake adb: unsupported $cmd" >&2; exit 1 ;;
+esac

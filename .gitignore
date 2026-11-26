@@ -1,0 +1,35 @@
+# Local corpus configuration (copy the *.example files)
+config/*
+!config/*.example
+!config/*.example.py
+
+# User-supplied media and derived data: never commit
+clips/
+ref/
+results/
+work/
+tmp/
+manifest.csv
+clip_cost.csv
+*.m2ts
+*.mkv
+*.framemd5
+*.jsonl
+.tv.pause
+.tv-settings-pending-*
+
+# Build products and local toolchains
+android/bin/
+android/build/
+android/sdk/
+baseline-build/
+bin/
+build/
+sdk/
+
+# Misc
+*.log
+*.bak*
+__pycache__/
+*.pyc
+.DS_Store

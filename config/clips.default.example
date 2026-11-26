@@ -1,0 +1,8 @@
+# Copy to config/clips.default (git-ignored) and edit. Read by android/tv_bench.sh.
+# Clip patterns are file names without extension, or <name>_<kind> prefixes that
+# match every start offset (see "ls $CORPUS/clips"). '#' starts a comment.
+#
+# default: clips used by a normal run (one per category is a good choice)
+# smoke:   the clip used by the smoke test (one pattern)
+default Sample1_peak Sample2_mid Sample3_peak Sample4_start
+smoke   Sample2_calm
