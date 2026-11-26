@@ -58,6 +58,7 @@ SINGLE_VARIANTS=${SINGLE_VARIANTS:-"$BASE_VARIANT single"}
 # "A:B" pairs compared side by side in the summary when both variants ran.
 COMPARE_PAIRS=${COMPARE_PAIRS:-"single:$BASE_VARIANT"}
 NO_RECONNECT=0
+CLIP_INPLACE=0   # 1 = clips are read from $CORPUS/clips directly (set by a local target)
 SETTINGS_APPLIED=0
 SETTINGS_FILE=
 SETTINGS_KEYS="global:stay_on_while_plugged_in secure:sleep_timeout secure:screensaver_enabled secure:screensaver_activate_on_sleep system:screen_off_timeout"
@@ -615,6 +616,7 @@ run_phase() { # label
         t_step=$(date +%s)
         clip=$(clip_file "$name")
         dclip=$CLIP_DIR/$clip
+        [ $CLIP_INPLACE = 1 ] && dclip=$CORPUS/clips/$clip
         case $kind in
         push)
             ci=$((ci + 1))
@@ -626,6 +628,11 @@ run_phase() { # label
             size_b=$(stat -f %z "$CORPUS/clips/$clip")
             size_kb=$(( size_b / 1024 ))
             SKIP_CLIP=0
+            if [ $CLIP_INPLACE = 1 ]; then
+                log "$prefix $cat, $frames frames @ $cfps fps: reading in place from $CORPUS/clips"
+                P_PRED_DONE=$((P_PRED_DONE + pred))
+                continue
+            fi
             have_b=$(dsh "ls -ln $dclip 2>/dev/null" | awk 'NR == 1 { print $5 }')
             if [ $DRY = 0 ] && [ "$have_b" = "$size_b" ]; then
                 log "$prefix $cat, $frames frames @ $cfps fps: already on the device"
@@ -752,7 +759,8 @@ run_phase() { # label
             ;;
         done)
             keep=0
-            if [ $KEEP_CLIPS = 1 ]; then
+            [ $CLIP_INPLACE = 1 ] && keep=1   # never delete the corpus clips
+            if [ $CLIP_INPLACE = 0 ] && [ $KEEP_CLIPS = 1 ]; then
                 free_kb=$(dev_free_kb)
                 [ -n "$free_kb" ] && [ "$free_kb" -ge "$KEEP_RESERVE_KB" ] && keep=1
             fi

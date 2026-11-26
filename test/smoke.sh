@@ -1,7 +1,7 @@
 #!/bin/bash
-# Smoke test: runs android/tv_bench.sh against the fake adb in test/fake-adb with
-# stub "ffmpeg" binaries and a tiny synthetic corpus. No device, no real video and
-# no real ffmpeg are involved; it checks the harness logic (config loading,
+# Smoke test: runs android/tv_bench.sh for both target types (adb via the fake adb
+# in test/fake-adb, and local on this host) with stub "ffmpeg" binaries and a
+# tiny synthetic corpus. No device, no real video and no real ffmpeg are involved; it checks the harness logic (config loading,
 # verify/bench phases, CSV and summary output, settings save/restore).
 #
 # Usage: test/smoke.sh        (exit status 0 = pass)
@@ -60,9 +60,25 @@ null) echo "bench: utime=1.000s stime=0.100s rtime=1.100s" >&2
 esac
 EOF
 for v in base threaded; do
-    cp "$T/stub" "$T/bin/ffmpeg-$v-armeabi-v7a"; chmod +x "$T/bin/ffmpeg-$v-armeabi-v7a"
-    echo "0000000000000000000000000000000000000000" > "$T/bin/ffmpeg-$v-armeabi-v7a.commit"
+    for arch in armeabi-v7a macos; do
+        cp "$T/stub" "$T/bin/ffmpeg-$v-$arch"; chmod +x "$T/bin/ffmpeg-$v-$arch"
+        echo "0000000000000000000000000000000000000000" > "$T/bin/ffmpeg-$v-$arch.commit"
+    done
 done
+
+# Target files: one adb (fake device, must never be woken), one local.
+mkdir -p "$T/targets"
+cat > "$T/targets/fakeadb.env" <<'EOF'
+TYPE=adb
+ARCH=armeabi-v7a
+SERIAL=fakehost:5555
+NO_WAKE=1
+EOF
+cat > "$T/targets/hostlocal.env" <<EOF
+TYPE=local
+ARCH=macos
+WORK_DIR=$T/localwork
+EOF
 
 export PATH="$REPO/test/fake-adb:$PATH"
 export FAKE_ADB_ROOT=$T/dev STUB_REF=$C/ref
@@ -92,4 +108,36 @@ else
 fi
 check grep -q "Smoke test: PASS" "$T/run.out" || true
 check grep -q "settings restored" "$T/run.out" || true
+
+# verify_rows DIR: every verify row must be a match
+verify_ok() {
+    [ -s "$1/verify.csv" ] && [ "$(tail -n +2 "$1/verify.csv" | wc -l | tr -d ' ')" -gt 0 ] &&
+        [ "$(tail -n +2 "$1/verify.csv" | awk -F, '$7 != "match"' | wc -l | tr -d ' ')" = 0 ]
+}
+
+echo "== adb target file (NO_WAKE=1 must enforce --no-wake)"
+export VC1_TARGETS_DIR=$T/targets
+rm -rf "$T/dev"; mkdir -p "$T/dev"
+rc=0
+"$REPO/android/tv_bench.sh" --yes --target fakeadb --runs 1 --threads '1 2' \
+    --verify-threads '1 2' --cooldown 0 --out "$T/res-t-adb" > "$T/run-t-adb.out" 2>&1 || rc=$?
+check test "$rc" = 0 || tail -30 "$T/run-t-adb.out"
+check verify_ok "$T/res-t-adb"
+check test -s "$T/res-t-adb/summary.md"
+check test ! -e "$T/dev/.fake/keyevents"       # no KEYCODE_WAKEUP was sent
+check grep -q "no-wake" "$T/res-t-adb/device.txt"
+
+echo "== local target (clips read in place)"
+rc=0
+"$REPO/android/tv_bench.sh" --yes --target hostlocal --runs 1 --threads '1 2' \
+    --verify-threads '1 2' --cooldown 0 --out "$T/res-local" > "$T/run-local.out" 2>&1 || rc=$?
+check test "$rc" = 0 || tail -30 "$T/run-local.out"
+cat "$T/res-local/verify.csv" 2>/dev/null
+check verify_ok "$T/res-local"
+check test -s "$T/res-local/summary.md"
+check test -s "$T/res-local/bench.csv"
+check test -f "$C/clips/SampleA_peak_0.mkv"    # corpus clips untouched
+check test -f "$C/clips/SampleA_calm_10.mkv"
+check grep -q "reading in place" "$T/run-local.out"
+
 [ "$fail" = 0 ] && echo "SMOKE TEST PASSED" || { echo "SMOKE TEST FAILED"; exit 1; }

@@ -6,7 +6,19 @@
 
 target_init() {
     ADB="local"
-    DEV_DIR=${DEV_DIR:-$HERE/local-device}
+    if [ "$LOCAL" = 1 ]; then
+        # legacy --local: clips are copied into a scratch dir like on a device
+        DEV_DIR=${DEV_DIR:-$HERE/local-device}
+    else
+        # TYPE=local target: WORK_DIR holds job scripts, logs and binary copies;
+        # clips are read in place from $CORPUS/clips (never copied or deleted).
+        DEV_DIR=${T_WORK_DIR:-${T_DEV_DIR:-$CORPUS/work/target-local}}
+        CLIP_INPLACE=1
+        case $(cd "$DEV_DIR" 2>/dev/null && pwd -P || echo "$DEV_DIR")/ in
+        "$(cd "$CORPUS/clips" 2>/dev/null && pwd -P || echo "$CORPUS/clips")"/*)
+            die "WORK_DIR ($DEV_DIR) must not be inside the clips directory" ;;
+        esac
+    fi
     POLL=${POLL:-1}
     MD5FPS=800 PUSH_BPS=2000000000
 }
