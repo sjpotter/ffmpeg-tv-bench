@@ -66,7 +66,8 @@ done
 
 export PATH="$REPO/test/fake-adb:$PATH"
 export FAKE_ADB_ROOT=$T/dev STUB_REF=$C/ref
-export CORPUS=$C VC1_BIN=$T/bin VC1_CLIPS_DEFAULT=$C/config/clips.default
+export CORPUS=$C VC1_BIN=$T/bin VC1_CLIPS_DEFAULT=$C/config/clips.default VC1_LOCAL_ENV=/dev/null
+unset BASE_VARIANT THREADED_VARIANT DEFAULT_VARIANTS SINGLE_VARIANTS COMPARE_PAIRS DEFAULT_CLIPS SMOKE_CLIP
 
 fail=0
 check() { if "$@"; then echo "PASS: $*"; else echo "FAIL: $*"; fail=1; return 1; fi; }

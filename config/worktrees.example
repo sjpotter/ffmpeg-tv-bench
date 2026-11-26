@@ -1,0 +1,5 @@
+# Copy to config/worktrees (git-ignored). Optional map of build_android.sh variant
+# names to ffmpeg source trees. $HOME is expanded. Variants not listed use
+# ${FFMPEG_WORKTREES:-$HOME/git/ffmpeg-worktrees}/<variant>.
+base=$HOME/src/ffmpeg-base
+threaded=$HOME/src/ffmpeg-mt

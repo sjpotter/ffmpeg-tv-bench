@@ -8,6 +8,7 @@
 #             reference) and "threaded" by default, e.g.
 #               build_android.sh base=$HOME/src/ffmpeg-base threaded=$HOME/src/ffmpeg-mt
 #   targets:  armeabi-v7a arm64-v8a macos (default all)
+# Local files: config/worktrees (name=path map), config/local.env (DEFAULT_VARIANTS).
 # Env: ANDROID_NDK_HOME (required for the Android targets), FFMPEG_WORKTREES,
 #      ANDROID_API (default 26)
 # Output: bin/ffmpeg-<variant>-<target> (+ .commit) next to this script.
@@ -23,11 +24,19 @@ JOBS=$(sysctl -n hw.ncpu)
 # otherwise the tree is ${FFMPEG_WORKTREES:-$HOME/git/ffmpeg-worktrees}/NAME.
 # NAME=PATH arguments are collected in OVERRIDES, one "name=path" per line.
 OVERRIDES=
+# Optional local map (git-ignored), "name=path" per line, '#' comments, $HOME
+# expanded; command-line NAME=PATH arguments win over it.
+WORKTREE_MAP=${VC1_WORKTREE_MAP:-$HERE/../config/worktrees}
+MAP_LINES=
+[ -f "$WORKTREE_MAP" ] && MAP_LINES=$(grep -v '^[[:space:]]*#' "$WORKTREE_MAP" | grep = | sed "s|\$HOME|$HOME|g; s|\${HOME}|$HOME|g")
+LOCAL_ENV=${VC1_LOCAL_ENV:-$HERE/../config/local.env}
+# shellcheck disable=SC1090
+[ -f "$LOCAL_ENV" ] && . "$LOCAL_ENV"
 src_for() {
     local name path
     while IFS='=' read -r name path; do
         [ "$name" = "$1" ] && { echo "$path"; return; }
-    done < <(printf '%s\n' "$OVERRIDES")
+    done < <(printf '%s\n%s\n' "$OVERRIDES" "$MAP_LINES")
     echo "${FFMPEG_WORKTREES:-$HOME/git/ffmpeg-worktrees}/$1"
 }
 
@@ -51,7 +60,7 @@ $1"; variants+=("${1%%=*}") ;;
     esac
     shift
 done
-[ ${#variants[@]} -eq 0 ] && variants=(base threaded)
+[ ${#variants[@]} -eq 0 ] && read -r -a variants <<< "${DEFAULT_VARIANTS:-base threaded}"
 [ ${#targets[@]} -eq 0 ] && targets=(armeabi-v7a arm64-v8a macos)
 
 needs_ndk=0

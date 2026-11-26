@@ -61,6 +61,7 @@ A variant is a named ffmpeg build; `bin/ffmpeg-<variant>-<abi>` must exist
 | `base` | the single-threaded reference build; only run with 1 thread |
 | `threaded` | the build under test, run with frame threading at several thread counts |
 
+The names come from `BASE_VARIANT`, `THREADED_VARIANT` and `DEFAULT_VARIANTS`, which can be set in the git-ignored `config/local.env` (see `config/local.env.example`; `VC1_LOCAL_ENV` overrides the path).
 Other names work: pass `--variants 'a b c'`. Variants listed in
 `SINGLE_VARIANTS` (default `base single`) only run at 1 thread. The summary
 adds side-by-side tables for the pairs in `COMPARE_PAIRS` ("new:base ..."

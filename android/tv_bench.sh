@@ -11,6 +11,12 @@ set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 CORPUS=${CORPUS:-$(cd "$HERE/.." && pwd)}
+# Optional local settings (git-ignored): BASE_VARIANT, THREADED_VARIANT,
+# SINGLE_VARIANTS, DEFAULT_VARIANTS, COMPARE_PAIRS, DEFAULT_CLIPS, SMOKE_CLIP...
+# Copy config/local.env.example to config/local.env. VC1_LOCAL_ENV overrides the path.
+LOCAL_ENV=${VC1_LOCAL_ENV:-$HERE/../config/local.env}
+# shellcheck disable=SC1090
+[ -f "$LOCAL_ENV" ] && . "$LOCAL_ENV"
 BIN=${VC1_BIN:-$HERE/bin}
 MANIFEST=$CORPUS/manifest.csv
 # Optional per-clip Mac single-thread fps for the run-time estimate
@@ -43,9 +49,14 @@ need_clip_defaults() { # default|smoke
     echo "  and edit it (or set VC1_CLIPS_DEFAULT, or pass --clips / DEFAULT_CLIPS / SMOKE_CLIP)" >&2
     exit 2
 }
-SINGLE_VARIANTS="base single"
+# Variant names: BASE_VARIANT is the single-threaded reference (also the one the
+# contention test and the "vs base" column use), THREADED_VARIANT the build under
+# test (headline table). Override in config/local.env (see below).
+BASE_VARIANT=${BASE_VARIANT:-base}
+THREADED_VARIANT=${THREADED_VARIANT:-threaded}
+SINGLE_VARIANTS=${SINGLE_VARIANTS:-"$BASE_VARIANT single"}
 # "A:B" pairs compared side by side in the summary when both variants ran.
-COMPARE_PAIRS=${COMPARE_PAIRS:-"single:base"}
+COMPARE_PAIRS=${COMPARE_PAIRS:-"single:$BASE_VARIANT"}
 SETTINGS_KEYS="global:stay_on_while_plugged_in secure:sleep_timeout secure:screensaver_enabled secure:screensaver_activate_on_sleep system:screen_off_timeout"
 
 usage() {
@@ -66,13 +77,13 @@ check, smoke test, then the full run. --yes runs unattended.
   --runs N             bench repetitions (default 3; 1 with --quick)
   --max-frames N       decode only the first N frames of each clip (ffmpeg -frames:v N);
                        fps uses N, verify compares the first N lines of ref/ (default: all)
-  --variants 'V ...'   variants (default 'base threaded'); single-threaded ones
+  --variants 'V ...'   variants (default '$BASE_VARIANT $THREADED_VARIANT'); single-threaded ones
                        ('$SINGLE_VARIANTS') only run 1 thread
   --no-keep-clips      delete each clip from the device after use (default: keep
                        clips for later runs while at least 512 MiB stays free)
   --clear-clips        delete the clips kept on the device, then continue
-  --contention N       also run N copies of 'base' at 1 thread at once per clip
-                       (cache/memory contention test; compared with base alone)
+  --contention N       also run N copies of '$BASE_VARIANT' at 1 thread at once per clip
+                       (cache/memory contention test; compared with $BASE_VARIANT alone)
   --abi ABI            force armeabi-v7a or arm64-v8a (default: from ro.product.cpu.abilist)
   --verify-only | --bench-only
   --cooldown S         sleep between bench runs (default 10)
@@ -106,7 +117,7 @@ parse_args() {
     VERIFY_THREADS=
     RUNS=
     MAX_FRAMES=0
-    VARIANTS="base threaded"
+    VARIANTS=${DEFAULT_VARIANTS:-"$BASE_VARIANT $THREADED_VARIANT"}
     ABI=
     ABI_FORCED=0
     DO_VERIFY=1
@@ -178,8 +189,8 @@ parse_args() {
     if [ "$MAX_FRAMES" -gt 0 ]; then FOPT="-frames:v $MAX_FRAMES"; fi
     if [ "$CONTENTION" -gt 1 ]; then
         case " $VARIANTS " in
-        *" base "*) ;;
-        *) echo "--contention runs 'base'; add it to --variants" >&2; exit 2 ;;
+        *" $BASE_VARIANT "*) ;;
+        *) echo "--contention runs '$BASE_VARIANT'; add it to --variants" >&2; exit 2 ;;
         esac
     fi
 
@@ -769,7 +780,7 @@ bench $name $v $n $r $(pred_step bench "$name" "$n")"
         if [ $P_DOB = 1 ] && [ "${P_PAR:-0}" -gt 1 ]; then
             for r in $(seq 1 "$P_RUNS"); do
                 have_par "$name" "$P_PAR" "$r" || steps="$steps
-par $name base $P_PAR $r $(pred_step par "$name" "$P_PAR")"
+par $name $BASE_VARIANT $P_PAR $r $(pred_step par "$name" "$P_PAR")"
             done
         fi
         [ -z "$steps" ] && continue
@@ -1019,17 +1030,17 @@ write_summary() { # dir title
         echo
         echo "## Decode speed (median of runs)"
         echo
-        echo "Speedup is against the same variant at 1 thread; 'vs base' is against base at 1 thread."
+        echo "Speedup is against the same variant at 1 thread; 'vs $BASE_VARIANT' is against $BASE_VARIANT at 1 thread."
         echo
-        echo "| clip | category | variant | threads | median fps | realtime x | speedup | vs base | runs | verify |"
+        echo "| clip | category | variant | threads | median fps | realtime x | speedup | vs $BASE_VARIANT | runs | verify |"
         echo "|---|---|---|---|---|---|---|---|---|---|"
-        awk -F, -v vcsv="$d/verify.csv" '
+        awk -F, -v bv="$BASE_VARIANT" -v vcsv="$d/verify.csv" '
             BEGIN { while ((getline line < vcsv) > 0) { split(line, f, ","); vs[f[1] "|" f[3] "|" f[5]] = f[7] } }
             { med[$1] = $2; cf[$1] = $3; runs[$1] = $4; order[++n] = $1 }
             END {
                 for (i = 1; i <= n; i++) {
                     key = order[i]; split(key, k, "|")
-                    b = med[k[1] "|" k[2] "|" k[3] "|1"]; fx = med[k[1] "|" k[2] "|base|1"]
+                    b = med[k[1] "|" k[2] "|" k[3] "|1"]; fx = med[k[1] "|" k[2] "|" bv "|1"]
                     st = vs[k[1] "|" k[3] "|" k[4]]
                     printf "| %s | %s | %s | %s | %.1f | %.2f | %s | %s | %d | %s |\n", k[1], k[2], k[3], k[4], med[key],
                         (cf[key] > 0 ? med[key] / cf[key] : 0),
@@ -1084,15 +1095,15 @@ contention_section() {
     echo
     echo "## Contention: independent single-thread decodes at once"
     echo
-    echo "Each copy is \`base\` at 1 thread on its own core. Alone = the \`base\` 1-thread bench runs."
+    echo "Each copy is \`$BASE_VARIANT\` at 1 thread on its own core. Alone = the \`$BASE_VARIANT\` 1-thread bench runs."
     echo "If copies need more CPU time than a lone decode, they are slowing each other through shared cache or memory."
     echo
     echo "| clip | copies | alone fps | fps per copy | per-copy speed | CPU time per copy vs alone |"
     echo "|---|---|---|---|---|---|"
-    awk -F, -v bcsv="$1/bench.csv" '
+    awk -F, -v bv="$BASE_VARIANT" -v bcsv="$1/bench.csv" '
         BEGIN {
             while ((getline line < bcsv) > 0) { split(line, f, ",")
-                if (f[3] == "base" && f[5] == 1 && f[7] == 0 && f[13] > 0) { af[f[1]] += f[13]; au[f[1]] += f[8]; an[f[1]]++ } }
+                if (f[3] == bv && f[5] == 1 && f[7] == 0 && f[13] > 0) { af[f[1]] += f[13]; au[f[1]] += f[8]; an[f[1]]++ } }
         }
         NR > 1 && $8 == 0 && $14 > 0 { k = $1 "|" $5; if (!(k in seen)) { seen[k] = 1; order[++n] = k }; pf[k] += $14; pu[k] += $9; pn[k]++ }
         END {
@@ -1106,7 +1117,7 @@ contention_section() {
 
 # headline DIR: one line per clip
 headline() {
-    awk -F, -v vcsv="$1/verify.csv" '
+    awk -F, -v bv="$BASE_VARIANT" -v tv="$THREADED_VARIANT" -v vcsv="$1/verify.csv" '
         BEGIN {
             while ((getline line < vcsv) > 0) {
                 split(line, f, ","); if (f[1] == "clip") continue
@@ -1115,10 +1126,10 @@ headline() {
             }
         }
         { split($1, k, "|"); c = k[1]; if (!(c in seen)) { seen[c] = 1; cl[++n] = c }
-          if (k[3] == "base" && k[4] == 1) fx[c] = $2
-          if (k[3] == "threaded") { if (k[4] == 1) p1[c] = $2; if ($2 > pb[c]) { pb[c] = $2; pt[c] = k[4]; rt[c] = $2 / $3 } } }
+          if (k[3] == bv && k[4] == 1) fx[c] = $2
+          if (k[3] == tv) { if (k[4] == 1) p1[c] = $2; if ($2 > pb[c]) { pb[c] = $2; pt[c] = k[4]; rt[c] = $2 / $3 } } }
         END {
-            print "| clip | base 1 thread fps | threaded 1 thread fps | threaded best fps (threads) | realtime x at best | verify |"
+            print "| clip | " bv " 1 thread fps | " tv " 1 thread fps | " tv " best fps (threads) | realtime x at best | verify |"
             print "|---|---|---|---|---|---|"
             for (i = 1; i <= n; i++) { c = cl[i]
                 printf "| %s | %s | %s | %s | %s | %s |\n", c, (c in fx ? sprintf("%.1f", fx[c]) : "-"), (c in p1 ? sprintf("%.1f", p1[c]) : "-"),

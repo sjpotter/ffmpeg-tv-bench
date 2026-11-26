@@ -65,7 +65,11 @@ cp config/clips.default.example config/clips.default # which clips a normal run 
 export CORPUS=$PWD        # or any directory with enough space
 ```
 
-`config/titles.py` and `config/clips.default` are git-ignored. Tools exit with a
+Optionally `cp config/local.env.example config/local.env` (variant names, default
+variants, comparison pairs) and `cp config/worktrees.example config/worktrees`
+(variant name to ffmpeg source tree map for `build_android.sh`).
+`config/titles.py`, `config/clips.default`, `config/local.env` and `config/worktrees`
+are git-ignored. Tools exit with a
 message pointing at the example when they are missing. `VC1_TITLES`,
 `VC1_SOURCE_ROOT` and `VC1_CLIPS_DEFAULT` override locations.
 
