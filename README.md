@@ -1,18 +1,27 @@
 # ffmpeg-tv-bench
 
-A harness for benchmarking and bit-exact verification of FFmpeg's VC-1 decoder
-on Android devices and macOS, single-threaded and frame-threaded.
+A harness for benchmarking and bit-exact verification of FFmpeg builds on real
+hardware: Android devices over adb, and the local machine (macOS), single-threaded
+and frame-threaded.
 
-It exists to answer two questions about a decoder change on real hardware:
-does it still produce bit-identical output on every kind of VC-1 stream
-(progressive, frame-interlaced, field-interlaced, many slices per picture), and
-how much faster is it at 1, 2, 3, 4 threads on slow ARM cores that an
-x86 or Apple Silicon workstation cannot represent?
+It exists to answer two questions about a decoder change: does it still produce
+bit-identical output on every kind of stream in a corpus, and how much faster is
+it at 1, 2, 3, 4 threads on slow cores (for example the ARM cores in a TV) that an
+x86 or Apple Silicon workstation cannot represent? It compares builds of FFmpeg
+("variants") against reference output from a trusted baseline build, and times
+them on one or more configured targets.
+
+Nothing in the core is tied to a particular codec: a run is "decode these clips
+with these ffmpeg binaries on this target, check the framemd5 against the
+references, report fps and CPU time". The first use was FFmpeg's VC-1 decoder, so
+the clip tooling, the default build configuration and some names (`VC1_*`
+variables, `vc1cfg.py`) are VC-1 specific today. See
+[What is VC-1 specific](#what-is-vc-1-specific).
 
 ## Important: no media included
 
 **This repository contains no video clips and no reference data**, and it never
-redistributes copyrighted material. You must supply your own VC-1 sources
+redistributes copyrighted material. You must supply your own video sources
 (for example Blu-ray rips you own). Clips and references are derived from those
 sources, stay on your machine, and are excluded by `.gitignore`. Keep them
 private.
@@ -22,9 +31,11 @@ private.
 | path | what |
 |---|---|
 | `tools/` | corpus preparation: `sample_bitrate.py`, `cut_clips.py`, `vc1_classify.py`, `scan_fields.py`, `make_refs.sh`, `make_manifest.py`, `validate_mac.sh` |
-| `android/` | `build_android.sh` (cross-build reduced ffmpeg), `tv_bench.sh` (device harness), see `android/README.md` |
+| `android/` | `build_android.sh` (wrapper: variant name to worktree, then `build/`), `tv_bench.sh` (the harness), see `android/README.md` |
+| `build/` | one build script per architecture (`android-armeabi-v7a.sh`, `android-arm64-v8a.sh`, `macos.sh`) and `common.sh` |
+| `lib/` | target implementations sourced by `tv_bench.sh`: `target-adb.sh`, `target-local.sh` |
 | `test/` | `smoke.sh` and `fake-adb/adb`: run the harness with no device |
-| `config/` | `*.example` files; your real config is copied next to them and is git-ignored |
+| `config/` | `*.example` files (including `targets/`); your real config is copied next to them and is git-ignored |
 
 ## Requirements
 
@@ -33,7 +44,8 @@ private.
   and a branch under test)
 - Android NDK (r26 or later; `ANDROID_NDK_HOME`) for the device builds
 - `adb`, and an Android device with developer mode and network or USB debugging
-- your own VC-1 sources (Blu-ray `.m2ts` or Matroska `.mkv`)
+- your own video sources (the clip tooling currently expects VC-1 in Blu-ray
+  `.m2ts` or Matroska `.mkv`)
 
 Optional: `shellcheck` for linting the shell scripts.
 
@@ -67,9 +79,11 @@ export CORPUS=$PWD        # or any directory with enough space
 
 Optionally `cp config/local.env.example config/local.env` (variant names, default
 variants, comparison pairs) and `cp config/worktrees.example config/worktrees`
-(variant name to ffmpeg source tree map for `build_android.sh`).
-`config/titles.py`, `config/clips.default`, `config/local.env` and `config/worktrees`
-are git-ignored. Tools exit with a
+(variant name to ffmpeg source tree map for `build_android.sh`), and
+`cp config/configure-flags.example config/configure-flags` to change which
+ffmpeg components the builds include.
+`config/titles.py`, `config/clips.default`, `config/local.env`, `config/worktrees`
+and `config/configure-flags` are git-ignored. Tools exit with a
 message pointing at the example when they are missing. `VC1_TITLES`,
 `VC1_SOURCE_ROOT` and `VC1_CLIPS_DEFAULT` override locations.
 
@@ -129,7 +143,7 @@ android/build_android.sh base=$HOME/src/ffmpeg-base threaded=$HOME/src/ffmpeg-mt
 Each variant name maps to `${FFMPEG_WORKTREES:-$HOME/git/ffmpeg-worktrees}/<name>`
 unless `name=/path` is given. Output: `android/bin/ffmpeg-<variant>-<target>`
 for armeabi-v7a, arm64-v8a and macos (`-- armeabi-v7a macos` selects targets).
-The component set is deliberately reduced (VC-1/WMV3 decoder and parser,
+The default component set (`config/configure-flags`) is deliberately reduced (VC-1/WMV3 decoder and parser,
 mpegts/matroska/vc1 demuxers, null/framemd5 muxers, rawvideo and scale for
 output), which keeps the binaries small and static. The variant names `base`
 (single-threaded reference) and `threaded` are what `tv_bench.sh` expects by
@@ -143,7 +157,7 @@ Optionally check the macOS build against the references on the host first:
 tools/validate_mac.sh android/bin/ffmpeg-threaded-macos results/mac verify
 ```
 
-### 5. Benchmark and verify on a device
+### 5. Benchmark and verify on a target
 
 ```sh
 android/tv_bench.sh -s HOST:5555 --quick
@@ -153,12 +167,90 @@ See `android/README.md` for what the script does to the device, its safety
 features (`--no-wake`, saved and restored device settings, pause file,
 cool-downs, reconnect handling), options and the layout of `results/`.
 
+## What is VC-1 specific
+
+The harness core (`android/tv_bench.sh`, `lib/`, the targets, framemd5
+verification, result summaries) only needs an ffmpeg binary, clips and reference
+framemd5 files. The parts that assume VC-1 are:
+
+- `tools/cut_clips.py` (entry-point aware cutting), `tools/vc1_classify.py` and
+  `tools/scan_fields.py` parse VC-1 bitstreams. Other codecs would need their own
+  cutting and classification, or plain `-ss ... -c copy` cuts.
+- The default `./configure` flags in `config/configure-flags.example` (VC-1/WMV3
+  decoder and parser, a few demuxers and muxers). Copy it to `config/configure-flags`
+  and edit it to benchmark another decoder.
+- Names: the `VC1_*` environment variables, `tools/vc1cfg.py`, the default device
+  directory `/data/local/tmp/vc1bench`, and the wording in some messages.
+
+These are not meant to stay this way. Abstracting them away (a codec-neutral
+config module and component set, per-codec clip tools) is future work.
+
+## Targets
+
+A target is the machine that decodes: an Android device over adb, or this Mac.
+Each is described by a small file `config/targets/<name>.env` and selected with
+`tv_bench.sh --target <name>` (`VC1_TARGETS_DIR` changes the directory). Real
+target files are git-ignored; only generic `*.example` files are committed:
+`config/targets/adb.env.example` and `config/targets/local.env.example`.
+
+| field | meaning |
+|---|---|
+| `TYPE` | `adb` or `local` |
+| `ARCH` | binary architecture, picks `ffmpeg-<variant>-<ARCH>`: `armeabi-v7a`, `arm64-v8a` or `macos` |
+| `BUILD` | the build script for that architecture (`build/android-armeabi-v7a.sh`, ...) |
+| `NOTES` | free text, logged |
+| `SERIAL`, `DEV_DIR` | adb only: serial or `HOST:PORT`; directory on the device (default `/data/local/tmp/vc1bench`) |
+| `WORK_DIR`, `BIN_DIR` | local only: scratch directory for jobs and logs; directory holding the binaries |
+| `NO_WAKE` | `1` never wakes the device or touches its power settings, and implies `--no-wake`. Use it for devices that must not be woken, so the flag cannot be forgotten |
+| `NO_SMOKE`, `COOLDOWN`, `TIMEOUT`, `RECONNECT_TRIES`, `VARIANTS` | defaults for the matching options |
+
+Command-line options override target fields. `-s SERIAL` still works and is an
+ad hoc adb target with no file.
+
+- **adb**: clips and binaries are pushed to the device, decodes run detached
+  there, settings are saved and restored (see `android/README.md`).
+- **local**: the binaries run on the host. Clips are read in place from
+  `$CORPUS/clips` (nothing is copied or deleted), the job directory is
+  `WORK_DIR`, and the temperature and clock columns are `na`. Verify and bench
+  use the same commands, thread flags, `--max-frames` handling and CSV columns as
+  adb. Wrap long Mac benchmarks in `lockf` if several people share the machine.
+
+```sh
+cp config/targets/adb.env.example   config/targets/tv.env      # edit SERIAL, ARCH
+cp config/targets/local.env.example config/targets/mac.env
+android/tv_bench.sh --target tv  --quick
+android/tv_bench.sh --target mac --max-frames 540 --threads 1 --runs 3
+```
+
+### Build-script contract
+
+Every `build/<name>.sh` takes `<ffmpeg-worktree-dir> <variant> [outdir]` and
+writes `ffmpeg-<variant>-<arch>` plus `ffmpeg-<variant>-<arch>.commit` to `outdir`
+(default `android/bin`). Prerequisites are in each script's header: the Android
+scripts need `ANDROID_NDK_HOME`, the macOS one needs Xcode's command line tools.
+They share the `./configure` flags in `config/configure-flags` (copy of
+`config/configure-flags.example`, git-ignored; `VC1_CONFIGURE_FLAGS` points elsewhere;
+the example is used if your copy is missing). `android/build_android.sh`
+still resolves variant names to worktrees and calls them.
+
+### Adding a target type (for example ssh)
+
+A type is one file, `lib/target-<type>.sh`, defining the same functions as
+`lib/target-adb.sh` (its header lists the interface): `target_init`,
+`connect_device`, `dsh` (run a shell one-liner), `dpush`/`dpull` (copy files),
+`reconnect`, the settings and power hooks (no-ops if the machine has none), and
+the probes (`target_probe`, `target_cpu_probe`, `target_device_info`,
+`target_job_tools`). Then use `TYPE=<type>` in a target file. An ssh type would
+implement `dsh` with `ssh`, `dpush`/`dpull` with `scp` or `rsync`, and use
+`/tmp` as the clip directory. Only `adb` and `local` are implemented here.
+
 ## Testing the harness without a device
 
 ```sh
 test/smoke.sh
 ```
 
-runs `android/tv_bench.sh --dry-run` and a complete run against `test/fake-adb`
-using stub binaries and a synthetic corpus. It needs no clips and no device and
+runs `android/tv_bench.sh --dry-run`, a complete run against `test/fake-adb`
+(ad hoc `-s` and a target file with `NO_WAKE=1`) and a complete run of a `local`
+target, using stub binaries and a synthetic corpus. It needs no clips and no device and
 checks the harness logic only, not any decoder.

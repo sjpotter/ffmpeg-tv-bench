@@ -51,6 +51,17 @@ Recovering:
 ./android/tv_bench.sh -s HOST:5555 --restore-settings results/tv-<...>/device-settings.orig
 ```
 
+## Targets
+
+`--target NAME` reads `config/targets/NAME.env` (see the top-level README for the
+fields, the `local` type and how to add a type). For an adb target,
+`SERIAL`, `DEV_DIR`, `NO_WAKE`, `NO_SMOKE`, `COOLDOWN`, `TIMEOUT`,
+`RECONNECT_TRIES` and `VARIANTS` set the defaults of the matching options;
+command-line options win, and `NO_WAKE=1` in the file makes `--no-wake`
+implicit. `-s SERIAL` is unchanged and needs no file. Real target files are
+git-ignored; copy `config/targets/adb.env.example`. The adb operations live in
+`lib/target-adb.sh`, those of a local target in `lib/target-local.sh`.
+
 ## Variants and binaries
 
 A variant is a named ffmpeg build; `bin/ffmpeg-<variant>-<abi>` must exist
@@ -193,4 +204,5 @@ binaries and a synthetic corpus. The fake adb can also simulate an unauthorized
 device (`FAKE_UNAUTH_POLLS`), settings that refuse to change (`FAKE_STUCK_KEYS`),
 connection drops (`FAKE_DROP_AT`, `FAKE_DROP_SECS`) and a different ABI list
 (`FAKE_ABILIST`); see the header of the script. `./tv_bench.sh --dry-run` prints
-the adb commands without running them.
+the adb commands without running them. The same script also runs the smoke test
+for a `local` target.

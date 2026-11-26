@@ -57,6 +57,10 @@ THREADED_VARIANT=${THREADED_VARIANT:-threaded}
 SINGLE_VARIANTS=${SINGLE_VARIANTS:-"$BASE_VARIANT single"}
 # "A:B" pairs compared side by side in the summary when both variants ran.
 COMPARE_PAIRS=${COMPARE_PAIRS:-"single:$BASE_VARIANT"}
+NO_RECONNECT=0
+CLIP_INPLACE=0   # 1 = clips are read from $CORPUS/clips directly (set by a local target)
+SETTINGS_APPLIED=0
+SETTINGS_FILE=
 SETTINGS_KEYS="global:stay_on_while_plugged_in secure:sleep_timeout secure:screensaver_enabled secure:screensaver_activate_on_sleep system:screen_off_timeout"
 
 usage() {
@@ -66,7 +70,9 @@ Usage: $(basename "$0") [options]
 Guided by default when stdin is a terminal: checklist, connect, settings
 check, smoke test, then the full run. --yes runs unattended.
 
-  -s SERIAL            adb serial, e.g. HOST:5555 (adb connect is done for you)
+  --target NAME        use config/targets/NAME.env (VC1_TARGETS_DIR overrides the directory);
+                       command-line options override its fields; NO_WAKE=1 there implies --no-wake
+  -s SERIAL            ad hoc adb target, e.g. HOST:5555 (adb connect is done for you)
   --yes                no prompts (unattended)
   --smoke              run only the smoke test (the "smoke" clip, both variants, threads 1 and 4)
   --no-smoke           skip the smoke test
@@ -108,37 +114,71 @@ EOF
 # ---------------------------------------------------------------------------
 # Options
 
+# load_target NAME: read config/targets/NAME.env (VC1_TARGETS_DIR overrides the
+# directory) into T_* variables. Fields: TYPE (adb|local), ARCH, BUILD, NOTES,
+# SERIAL, DEV_DIR, WORK_DIR, BIN_DIR, NO_WAKE, NO_SMOKE, COOLDOWN, TIMEOUT,
+# RECONNECT_TRIES, VARIANTS. Command-line options override them.
+load_target() {
+    local f=${VC1_TARGETS_DIR:-$HERE/../config/targets}/$1.env k
+    if [ ! -f "$f" ]; then
+        echo "no target '$1': $f is missing" >&2
+        echo "  copy config/targets/<type>.env.example to $f and edit it" >&2
+        exit 2
+    fi
+    for k in TYPE ARCH BUILD NOTES SERIAL DEV_DIR WORK_DIR BIN_DIR NO_WAKE NO_SMOKE COOLDOWN TIMEOUT RECONNECT_TRIES VARIANTS; do unset "$k"; done
+    # shellcheck disable=SC1090
+    . "$f"
+    T_TYPE=${TYPE:-adb} T_ARCH=${ARCH:-} T_BUILD=${BUILD:-} T_NOTES=${NOTES:-}
+    T_SERIAL=${SERIAL:-} T_DEV_DIR=${DEV_DIR:-} T_WORK_DIR=${WORK_DIR:-} T_BIN_DIR=${BIN_DIR:-}
+    T_NO_WAKE=${NO_WAKE:-} T_NO_SMOKE=${NO_SMOKE:-} T_COOLDOWN=${COOLDOWN:-}
+    T_TIMEOUT=${TIMEOUT:-} T_RECONNECT_TRIES=${RECONNECT_TRIES:-} T_VARIANTS=${VARIANTS:-}
+    [ -f "$HERE/../lib/target-$T_TYPE.sh" ] || {
+        echo "$f: unknown TYPE '$T_TYPE' (no lib/target-$T_TYPE.sh)" >&2; exit 2; }
+    for k in TYPE ARCH BUILD NOTES SERIAL DEV_DIR WORK_DIR BIN_DIR NO_WAKE NO_SMOKE COOLDOWN TIMEOUT RECONNECT_TRIES VARIANTS; do unset "$k"; done
+}
+
 parse_args() {
     ORIG_ARGS=
     [ $# -gt 0 ] && ORIG_ARGS=$(printf "'%s' " "$@")
-    SERIAL=
+    # Target file first (so that command-line options can override its fields).
+    TARGET_NAME=
+    T_TYPE=adb T_ARCH= T_BUILD= T_NOTES= T_SERIAL= T_DEV_DIR= T_WORK_DIR= T_BIN_DIR=
+    T_NO_WAKE= T_NO_SMOKE= T_COOLDOWN= T_TIMEOUT= T_RECONNECT_TRIES= T_VARIANTS=
+    local prev=
+    for a in "$@"; do
+        [ "$prev" = --target ] && TARGET_NAME=$a
+        prev=$a
+    done
+    [ -n "$TARGET_NAME" ] && load_target "$TARGET_NAME"
+    SERIAL=$T_SERIAL
     CLIPS_ARG=
     BENCH_THREADS=
     VERIFY_THREADS=
     RUNS=
     MAX_FRAMES=0
-    VARIANTS=${DEFAULT_VARIANTS:-"$BASE_VARIANT $THREADED_VARIANT"}
+    VARIANTS=${T_VARIANTS:-${DEFAULT_VARIANTS:-"$BASE_VARIANT $THREADED_VARIANT"}}
     ABI=
     ABI_FORCED=0
     DO_VERIFY=1
     DO_BENCH=1
-    COOLDOWN=10
-    TIMEOUT=1800
-    RECONNECT_TRIES=6
+    COOLDOWN=${T_COOLDOWN:-10}
+    TIMEOUT=${T_TIMEOUT:-1800}
+    RECONNECT_TRIES=${T_RECONNECT_TRIES:-6}
     SLOWDOWN=
     OUT=
     RESUME=0
     FORCE=0
     DRY=0
     LOCAL=0
+    TARGET_TYPE=$T_TYPE
     YES=0
     SMOKE_ONLY=0
-    NO_SMOKE=0
+    NO_SMOKE=${T_NO_SMOKE:-0}
     QUICK=0
     CONTENTION=0
     KEEP_CLIPS=1
     CLEAR_CLIPS=0
-    NO_WAKE=0
+    NO_WAKE=${T_NO_WAKE:-0}   # NO_WAKE=1 in a target file makes --no-wake implicit
     RESTORE_FILE=
 
     while [ $# -gt 0 ]; do
@@ -169,7 +209,8 @@ parse_args() {
         --force) FORCE=1 ;;
         --restore-settings) RESTORE_FILE=$2; shift ;;
         --dry-run) DRY=1 ;;
-        --local) LOCAL=1 ;;
+        --target) shift ;;   # handled above
+        --local) LOCAL=1; TARGET_TYPE=local ;;
         --no-wake) NO_WAKE=1 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -197,15 +238,11 @@ parse_args() {
     INTERACTIVE=0
     [ -t 0 ] && [ $YES = 0 ] && [ $DRY = 0 ] && INTERACTIVE=1
 
-    ADB="adb"
-    [ -n "$SERIAL" ] && ADB="adb -s $SERIAL"
-    if [ $LOCAL = 1 ]; then
-        DEV_DIR=${DEV_DIR:-$HERE/local-device}
-        POLL=${POLL:-1}
-    else
-        DEV_DIR=/data/local/tmp/vc1bench
-        POLL=${POLL:-5}
-    fi
+    # Target implementation: transport and device operations live in lib/.
+    # shellcheck disable=SC1090
+    . "$HERE/../lib/target-$TARGET_TYPE.sh"
+    [ -n "$T_BIN_DIR" ] && [ -z "${VC1_BIN:-}" ] && BIN=$T_BIN_DIR
+    target_init
     JOB_DIR=$DEV_DIR/jobs
     CLIP_DIR=$DEV_DIR/clips
     KEEP_RESERVE_KB=$((512 * 1024))
@@ -257,43 +294,6 @@ fmt_dur() { # seconds -> 1h05m / 12m / 40s
 # ---------------------------------------------------------------------------
 # adb transport
 
-adb_state() { # device | unauthorized | offline | none | multiple
-    if [ $LOCAL = 1 ]; then echo device; return; fi
-    adb devices 2>/dev/null | tr -d '\r' | awk -v s="$SERIAL" '
-        NR > 1 && NF >= 2 { n++; if (s == "" || $1 == s) { st = $2; m++ } }
-        END { if (s == "" && n > 1) print "multiple"; else print (st == "" ? "none" : st) }'
-}
-
-adb_connect_once() {
-    case $SERIAL in
-    *:*)
-        adb disconnect "$SERIAL" > /dev/null 2>&1
-        adb connect "$SERIAL" 2>&1 | tr -d '\r' >> "$ADBLOG"
-        ;;
-    esac
-    sleep 1
-}
-
-NO_RECONNECT=0
-# reconnect: up to RECONNECT_TRIES attempts with exponential backoff.
-reconnect() {
-    [ $LOCAL = 1 ] && return 0
-    local tries=$RECONNECT_TRIES delay=$RECONNECT_DELAY i st
-    [ $NO_RECONNECT = 1 ] && tries=1
-    i=1
-    while [ $i -le "$tries" ]; do
-        st=$(adb_state)
-        [ "$st" = device ] && return 0
-        log "adb: device is '$st', reconnect attempt $i/$tries"
-        adb_connect_once
-        [ "$(adb_state)" = device ] && { log "adb: reconnected"; return 0; }
-        [ $i -lt "$tries" ] && sleep "$delay"
-        delay=$((delay * 2)); [ $delay -gt 60 ] && delay=60
-        i=$((i + 1))
-    done
-    return 1
-}
-
 # Between decodes, wait while the pause file exists (touch it to pause after
 # the current decode, remove it to continue). No adb traffic while paused.
 PAUSE_FILE=${TV_PAUSE_FILE:-$CORPUS/.tv.pause}
@@ -303,86 +303,6 @@ wait_if_paused() {
     while [ -e "$PAUSE_FILE" ]; do sleep 10; done
     log "resumed"
     reconnect || die_lost "reconnecting after pause"
-}
-
-# dsh CMD: run CMD on the device and print its output. Returns 99 if the
-# device can't be reached even after reconnecting.
-dsh() {
-    if [ $DRY = 1 ]; then echo "+ $ADB shell '$1'" >&2; return 0; fi
-    local out
-    if [ $LOCAL = 1 ]; then sh -c "$1" < /dev/null; return 0; fi
-    out=$($ADB shell "$1
-echo __DSH_OK__" < /dev/null 2>> "$ADBLOG" | tr -d '\r')
-    case $out in
-    *__DSH_OK__) ;;
-    *)
-        reconnect || return 99
-        out=$($ADB shell "$1
-echo __DSH_OK__" < /dev/null 2>> "$ADBLOG" | tr -d '\r')
-        case $out in *__DSH_OK__) ;; *) return 99 ;; esac
-        ;;
-    esac
-    printf '%s' "${out%__DSH_OK__}"
-}
-
-dpush() {
-    if [ $DRY = 1 ]; then echo "+ $ADB push '$1' '$2'" >&2; return 0; fi
-    if [ $LOCAL = 1 ]; then cp -c "$1" "$2" 2>/dev/null || cp "$1" "$2"; return; fi
-    $ADB push "$1" "$2" < /dev/null >> "$ADBLOG" 2>&1 && return 0
-    reconnect && $ADB push "$1" "$2" < /dev/null >> "$ADBLOG" 2>&1
-}
-
-dpull() {
-    if [ $DRY = 1 ]; then echo "+ $ADB pull '$1' '$2'" >&2; return 0; fi
-    if [ $LOCAL = 1 ]; then cp "$1" "$2"; return; fi
-    $ADB pull "$1" "$2" < /dev/null >> "$ADBLOG" 2>&1 && return 0
-    reconnect && $ADB pull "$1" "$2" < /dev/null >> "$ADBLOG" 2>&1
-}
-
-die_lost() {
-    die "lost the device ($1). Reconnect (adb connect ${SERIAL:-<TV_IP>:5555}) and resume with:
-    $0 --out $OUT $ORIG_ARGS"
-}
-
-# Wait until the device is connected and authorized.
-connect_device() {
-    [ $LOCAL = 1 ] || [ $DRY = 1 ] && return 0
-    command -v adb > /dev/null || die "adb not found (brew install --cask android-platform-tools)"
-    if [ -z "$SERIAL" ] && [ $INTERACTIVE = 1 ] && [ "$(adb_state)" = none ]; then
-        printf 'TV IP address (port 5555 is assumed): ' >&2
-        read -r ip
-        case $ip in *:*) SERIAL=$ip ;; *) SERIAL=$ip:5555 ;; esac
-        ADB="adb -s $SERIAL"
-    fi
-    wait_s=120
-    [ $INTERACTIVE = 1 ] && wait_s=600
-    start=$(date +%s) told=0 last_connect=0
-    while :; do
-        st=$(adb_state)
-        case $st in
-        device) break ;;
-        multiple) die "several adb devices are connected; pass -s SERIAL" ;;
-        unauthorized)
-            if [ $told = 0 ]; then
-                say ""
-                say ">>> The TV is asking for permission. On the TV, select 'Always allow from this computer'"
-                say ">>> and then OK in the 'Allow USB debugging?' dialog. Waiting..."
-                told=1
-            fi ;;
-        *)
-            now=$(date +%s)
-            if [ $((now - last_connect)) -ge 10 ]; then
-                case $SERIAL in
-                *:*) log "adb connect $SERIAL"; adb connect "$SERIAL" 2>&1 | tr -d '\r' | sed 's/^/    /' >&2 ;;
-                *) [ $told = 0 ] && say "Waiting for the device (${SERIAL:-any}) to show up in 'adb devices'..." ; told=2 ;;
-                esac
-                last_connect=$now
-            fi ;;
-        esac
-        [ $(($(date +%s) - start)) -ge $wait_s ] && die "device not ready after ${wait_s}s (adb state: $st)"
-        sleep 3
-    done
-    log "adb: ${SERIAL:-device} connected and authorized"
 }
 
 # ---------------------------------------------------------------------------
@@ -400,22 +320,6 @@ parse_therm() {
 
 dev_thermal() { dsh "$THERM_CMD" | parse_therm; }
 
-power_state() {
-    [ $LOCAL = 1 ] && { echo "local"; return; }
-    dsh "dumpsys power | grep -E 'mWakefulness=|Display Power'" | sed 's/^ *//' | tr '\n' ';' | sed 's/;$//'
-}
-
-check_awake() { # label
-    [ $LOCAL = 1 ] || [ $DRY = 1 ] && return 0
-    ps_=$(power_state)
-    log "power ($1): $ps_"
-    [ $NO_WAKE = 1 ] && return 0
-    case $ps_ in
-    *mWakefulness=Awake*) return 0 ;;
-    *) warn "the TV is not awake ($ps_); decoding may stop or slow down"; return 1 ;;
-    esac
-}
-
 # Free KiB on the filesystem holding DEV_DIR, empty if unknown. Toybox
 # "df -P" reports 512-byte blocks even with -k, so honour the header.
 dev_free_kb() {
@@ -427,102 +331,6 @@ dev_free_kb() {
 
 # ---------------------------------------------------------------------------
 # TV power settings: save, apply, restore
-
-settings_get_all() { # prints "ns key value" lines
-    cmd=
-    for k in $SETTINGS_KEYS; do
-        cmd="$cmd echo \"${k%%:*} ${k#*:} \$(settings get ${k%%:*} ${k#*:})\";"
-    done
-    cmd="$cmd echo \"deviceidle deep \$(dumpsys deviceidle enabled deep)\"; echo \"deviceidle light \$(dumpsys deviceidle enabled light)\""
-    dsh "$cmd"
-}
-
-SETTINGS_APPLIED=0
-SETTINGS_FILE=
-
-apply_settings() {
-    [ $LOCAL = 1 ] && return 0
-    SETTINGS_FILE=$OUT/device-settings.orig
-    pending=$CORPUS/results/.tv-settings-pending-$(echo "${SERIAL:-default}" | tr -c 'A-Za-z0-9_.-' '_')
-    if [ $DRY = 0 ] && [ -f "$pending" ] && [ -s "$(cat "$pending")" ]; then
-        prev=$(cat "$pending")
-        warn "a previous run did not restore the TV settings; keeping its originals from $prev"
-        [ "$prev" != "$SETTINGS_FILE" ] && cp "$prev" "$SETTINGS_FILE"
-    elif [ $DRY = 0 ]; then
-        settings_get_all > "$SETTINGS_FILE.tmp" || die_lost "reading settings"
-        grep -c . "$SETTINGS_FILE.tmp" | grep -qv '^0$' || die "could not read the TV settings"
-        mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
-    else
-        settings_get_all > /dev/null
-    fi
-    [ $DRY = 0 ] && echo "$SETTINGS_FILE" > "$pending"
-    SETTINGS_APPLIED=1
-
-    dsh 'svc power stayon true; settings put secure sleep_timeout -1; settings put secure screensaver_enabled 0; settings put secure screensaver_activate_on_sleep 0; settings put system screen_off_timeout 2147483647; dumpsys deviceidle disable > /dev/null' > /dev/null
-    [ $DRY = 1 ] && return 0
-
-    settings_get_all > "$OUT/device-settings.applied"
-    SETTINGS_REPORT=$(awk '
-        FNR == NR { orig[$1 " " $2] = $3; next }
-        {
-            k = $1 " " $2
-            want["global stay_on_while_plugged_in"] = "7"; want["secure sleep_timeout"] = "-1"
-            want["secure screensaver_enabled"] = "0"; want["secure screensaver_activate_on_sleep"] = "0"
-            want["system screen_off_timeout"] = "2147483647"
-            want["deviceidle deep"] = "0"; want["deviceidle light"] = "0"
-            ok = ($3 == want[k]) ? "ok" : "NOT APPLIED"
-            printf "  %-45s %-11s -> %-11s %s\n", k, orig[k], $3, ok
-        }' "$SETTINGS_FILE" "$OUT/device-settings.applied")
-    SETTINGS_BAD=$(echo "$SETTINGS_REPORT" | grep -c 'NOT APPLIED')
-    if [ $INTERACTIVE = 1 ]; then
-        { echo "power settings (original -> now):"; echo "$SETTINGS_REPORT"; } >> "$RUNLOG"
-    else
-        log "power settings (original -> now):"
-        say "$SETTINGS_REPORT"
-    fi
-    [ "$SETTINGS_BAD" -gt 0 ] && [ $INTERACTIVE = 0 ] &&
-        warn "$SETTINGS_BAD power setting(s) did not take; the TV may sleep during the run"
-    return 0
-}
-
-# restore_settings FILE: tolerate a missing device (one reconnect attempt).
-restore_settings() {
-    f=$1
-    [ -s "$f" ] || { warn "no saved settings in $f"; return 1; }
-    if [ $DRY = 0 ] && [ $LOCAL = 0 ] && [ "$(adb_state)" != device ]; then
-        log "restore: device not connected, trying to reconnect once"
-        adb_connect_once
-        if [ "$(adb_state)" != device ]; then
-            warn "TV settings NOT restored (device unreachable). Later run:
-    $0 -s ${SERIAL:-<TV_IP>:5555} --restore-settings $f"
-            return 1
-        fi
-    fi
-    cmd=$(awk '
-        $1 == "deviceidle" { if ($3 == "1") printf "dumpsys deviceidle enable %s > /dev/null; ", $2
-                             else if ($3 == "0") printf "dumpsys deviceidle disable %s > /dev/null; ", $2; next }
-        NF < 3 || $3 == "null" { printf "settings delete %s %s > /dev/null; ", $1, $2; next }
-        { printf "settings put %s %s %s; ", $1, $2, $3 }' "$f")
-    NO_RECONNECT=1
-    if dsh "$cmd" > /dev/null; then
-        now=$(settings_get_all)
-        if [ "$(echo "$now" | sort)" = "$(sort "$f")" ]; then
-            log "TV settings restored from $f"
-        else
-            warn "TV settings restored with differences:"
-            echo "$now" | diff "$f" - | sed 's/^/    /' >&2
-        fi
-        for p in "$CORPUS"/results/.tv-settings-pending-*; do
-            [ -f "$p" ] && [ "$(cat "$p")" = "$f" ] && rm -f "$p"
-        done
-        SETTINGS_APPLIED=0
-        NO_RECONNECT=0
-        return 0
-    fi
-    NO_RECONNECT=0
-    warn "TV settings NOT restored. Later run: $0 -s ${SERIAL:-<TV_IP>:5555} --restore-settings $f"
-    return 1
-}
 
 # ---------------------------------------------------------------------------
 # Detached decode jobs: launch on the device, poll for the exit-code file.
@@ -808,6 +616,7 @@ run_phase() { # label
         t_step=$(date +%s)
         clip=$(clip_file "$name")
         dclip=$CLIP_DIR/$clip
+        [ $CLIP_INPLACE = 1 ] && dclip=$CORPUS/clips/$clip
         case $kind in
         push)
             ci=$((ci + 1))
@@ -819,6 +628,11 @@ run_phase() { # label
             size_b=$(stat -f %z "$CORPUS/clips/$clip")
             size_kb=$(( size_b / 1024 ))
             SKIP_CLIP=0
+            if [ $CLIP_INPLACE = 1 ]; then
+                log "$prefix $cat, $frames frames @ $cfps fps: reading in place from $CORPUS/clips"
+                P_PRED_DONE=$((P_PRED_DONE + pred))
+                continue
+            fi
             have_b=$(dsh "ls -ln $dclip 2>/dev/null" | awk 'NR == 1 { print $5 }')
             if [ $DRY = 0 ] && [ "$have_b" = "$size_b" ]; then
                 log "$prefix $cat, $frames frames @ $cfps fps: already on the device"
@@ -945,7 +759,8 @@ run_phase() { # label
             ;;
         done)
             keep=0
-            if [ $KEEP_CLIPS = 1 ]; then
+            [ $CLIP_INPLACE = 1 ] && keep=1   # never delete the corpus clips
+            if [ $CLIP_INPLACE = 0 ] && [ $KEEP_CLIPS = 1 ]; then
                 free_kb=$(dev_free_kb)
                 [ -n "$free_kb" ] && [ "$free_kb" -ge "$KEEP_RESERVE_KB" ] && keep=1
             fi
@@ -1141,14 +956,7 @@ headline() {
 # Steps
 
 preflight() {
-    if [ $LOCAL = 1 ]; then
-        MODEL=local-$(sysctl -n hw.model 2>/dev/null || uname -m)
-        ABILIST=macos
-    else
-        MODEL=$(dsh 'getprop ro.product.model')
-        ABILIST=$(dsh 'getprop ro.product.cpu.abilist')
-        [ -z "$MODEL" ] && MODEL=dryrun
-    fi
+    target_probe
     MODEL_TAG=$(echo "$MODEL" | tr -c 'A-Za-z0-9_.-' '_' | sed 's/_*$//')
 
     if [ -z "$ABI" ]; then
@@ -1156,7 +964,7 @@ preflight() {
         *,macos,*) ABI=macos ;;
         *,arm64-v8a,*) ABI=arm64-v8a ;;
         *,armeabi-v7a,*) ABI=armeabi-v7a ;;
-        ,,) ABI=armeabi-v7a; log "abilist unknown (dry run), assuming $ABI" ;;
+        ,,) ABI=${T_ARCH:-armeabi-v7a}; log "abilist unknown (dry run), assuming $ABI" ;;
         *) die "no supported ABI in abilist '$ABILIST'" ;;
         esac
     fi
@@ -1176,48 +984,22 @@ preflight() {
     RUNLOG=$OUT/run.log
     ADBLOG=$OUT/logs/adb.log
     log "results: $OUT"
+    [ -n "$TARGET_NAME" ] && log "target: $TARGET_NAME ($TARGET_TYPE)${T_NOTES:+ - $T_NOTES}"
     log "model: $MODEL  abilist: $ABILIST  abi: $ABI  device dir: $DEV_DIR"
     if [ "$MAX_FRAMES" -gt 0 ]; then log "max-frames: first $MAX_FRAMES frames of each clip"; fi
 
     {
-        echo "=== $(date '+%Y-%m-%d %H:%M:%S') $([ $LOCAL = 1 ] && echo local || echo "adb ${SERIAL:-default}")"
+        echo "=== $(date '+%Y-%m-%d %H:%M:%S') $(target_label)"
         echo "model: $MODEL"
         echo "abilist: $ABILIST"
         echo "abi used: $ABI"
         for v in $VARIANTS; do
             echo "binary $v: ffmpeg-$v-$ABI commit $(cat "$BIN/ffmpeg-$v-$ABI.commit" 2>/dev/null)"
         done
-        if [ $LOCAL = 1 ]; then
-            sysctl -n machdep.cpu.brand_string hw.ncpu 2>/dev/null
-        else
-            dsh 'echo "release: $(getprop ro.build.version.release) sdk: $(getprop ro.build.version.sdk)"
-                 echo "fingerprint: $(getprop ro.build.fingerprint)"
-                 echo "board: $(getprop ro.board.platform) hardware: $(getprop ro.hardware)"
-                 echo "nproc: $(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo) (possible: $(cat /sys/devices/system/cpu/possible 2>/dev/null) online: $(cat /sys/devices/system/cpu/online 2>/dev/null))"
-                 echo "--- uname"; uname -a
-                 echo "--- meminfo"; head -3 /proc/meminfo
-                 echo "--- df /data/local/tmp"; df /data/local/tmp
-                 echo "--- power"; dumpsys power | grep -E "mWakefulness=|Display Power"
-                 echo "--- cpufreq"
-                 for c in /sys/devices/system/cpu/cpu[0-9]*; do
-                     echo "$(basename $c): online=$(cat $c/online 2>/dev/null) gov=$(cat $c/cpufreq/scaling_governor 2>/dev/null) cur=$(cat $c/cpufreq/scaling_cur_freq 2>/dev/null) max=$(cat $c/cpufreq/cpuinfo_max_freq 2>/dev/null) min=$(cat $c/cpufreq/cpuinfo_min_freq 2>/dev/null)"
-                 done
-                 echo "--- thermal"
-                 for z in /sys/class/thermal/thermal_zone*; do
-                     echo "$(basename $z): type=$(cat $z/type 2>/dev/null) temp=$(cat $z/temp 2>/dev/null)"
-                 done
-                 echo "--- cpuinfo"; cat /proc/cpuinfo'
-        fi
+        target_device_info
     } >> "$OUT/device.txt"
 
-    if [ $LOCAL = 1 ]; then
-        NCPU=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.ncpu)
-        MAXFREQ=na
-    else
-        NCPU=$(dsh 'nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo' | tr -dc 0-9)
-        MAXFREQ=$(dsh 'cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/cpuinfo_max_freq 2>/dev/null' |
-            awk '{ v = int($1 / 1000); if (v > m) m = v } END { print (m ? m : "na") }')
-    fi
+    target_cpu_probe
     [ -z "$NCPU" ] && NCPU=4
     set -- $(dev_thermal)
     BASE_TEMP=$1
@@ -1230,7 +1012,6 @@ preflight() {
         *) SLOWDOWN=13 ;;
         esac
     fi
-    if [ $LOCAL = 1 ]; then MD5FPS=800 PUSH_BPS=2000000000; else MD5FPS=60 PUSH_BPS=6000000; fi
 
     # Leftovers from an interrupted run must not compete for the CPU.
     dsh "pkill -f '$DEV_DIR/ffmpeg-' 2>/dev/null; mkdir -p $JOB_DIR $CLIP_DIR && rm -f $JOB_DIR/* $DEV_DIR/*.m2ts $DEV_DIR/*.mkv $DEV_DIR/*.framemd5 $DEV_DIR/par.*.log" > /dev/null
@@ -1254,19 +1035,12 @@ preflight() {
         esac
     fi
 
-    if [ $LOCAL = 1 ]; then
-        TO= SETSID=
-    else
-        TO= SETSID=
-        if [ $DRY = 1 ] || dsh 'timeout 2 true && echo ok' | grep -q '^ok$'; then TO="timeout $TIMEOUT"; fi
-        if [ $DRY = 1 ] || dsh 'command -v setsid > /dev/null && echo ok' | grep -q '^ok$'; then SETSID=setsid; fi
-        [ -z "$TO" ] && log "no timeout command on the device; the host enforces --timeout"
-    fi
+    target_job_tools
 }
 
 push_binaries() {
     for v in $VARIANTS; do
-        [ -x "$BIN/ffmpeg-$v-$ABI" ] || die "missing binary $BIN/ffmpeg-$v-$ABI (run build_android.sh)"
+        [ -x "$BIN/ffmpeg-$v-$ABI" ] || die "missing binary $BIN/ffmpeg-$v-$ABI (${T_BUILD:+build it with $T_BUILD <worktree> $v; or }run build_android.sh)"
         dpush "$BIN/ffmpeg-$v-$ABI" "$DEV_DIR/ffmpeg-$v" || die_lost "pushing ffmpeg-$v"
         dsh "chmod 755 $DEV_DIR/ffmpeg-$v" > /dev/null
         ver=$(dsh "$DEV_DIR/ffmpeg-$v -hide_banner -version 2>&1 | head -1")
@@ -1279,47 +1053,10 @@ push_binaries() {
     done
 }
 
-checklist() {
-    cat >&2 <<EOF
-
-==== VC-1 TV benchmark: before you start ====
-
-On the device (Android TV or similar):
-  1. Settings > Device Preferences > About: select 'Build' 7 times (developer mode).
-  2. Settings > Device Preferences > Developer options: turn on 'USB debugging'
-     and 'Network debugging' if listed.
-  3. Settings > Power > any idle/standby timer: Off. (Vendor timers are not covered by
-     the Android settings this script changes.)
-  4. Screen saver off (Settings > Device Preferences > Screen saver), optional:
-     the script also disables it for the run and restores it afterwards.
-  5. Prefer Ethernet: each clip (up to ~400 MB) is copied to the TV.
-  6. Note the TV's IP: Settings > Network & Internet.
-
-EOF
-    pause "Press Enter when done..."
-}
-
 validate_report() {
     say ""
     say "==== Validating TV settings ===="
-    if [ $LOCAL = 1 ]; then
-        say "  local mode: $MODEL, $NCPU cores"
-    else
-        dsh 'echo "  model:    $(getprop ro.product.manufacturer) $(getprop ro.product.model)"
-             echo "  Android:  $(getprop ro.build.version.release) (SDK $(getprop ro.build.version.sdk))"
-             echo "  abilist:  $(getprop ro.product.cpu.abilist)"
-             echo "  cpu:      $(grep -m1 -E "^(Hardware|model name|Processor)" /proc/cpuinfo | cut -d: -f2-) x$(grep -c ^processor /proc/cpuinfo)"
-             echo "  governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)  cur/max: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo ?)/$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo ?) kHz"
-             echo "  temps:    $(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | tr "\n" " ")"
-             echo "  free:     $(df -h /data/local/tmp | tail -1)"
-             echo "  power:    $(dumpsys power | grep -E "mWakefulness=|Display Power" | tr -s " " | tr "\n" " ")"' >&2
-        say "  using:    $ABI binaries"
-        say "  power settings (original -> now):"
-        say "${SETTINGS_REPORT:-  (dry run)}"
-        if [ "${SETTINGS_BAD:-0}" -gt 0 ]; then
-            warn "$SETTINGS_BAD power setting(s) did not take; the TV may sleep during the run. Check that any idle/standby timer is Off."
-        fi
-    fi
+    target_validate_report
     say ""
     pause
 }
@@ -1412,11 +1149,9 @@ main() {
         CAFF_PID=$!
     fi
 
-    [ $INTERACTIVE = 1 ] && [ $LOCAL = 0 ] && checklist
+    [ $INTERACTIVE = 1 ] && target_checklist
     connect_device
-    # The only key event this script sends; never SLEEP/POWER, and not per
-    # clip, which would undo the user's "Picture off".
-    [ $LOCAL = 0 ] && [ $NO_WAKE = 0 ] && dsh 'input keyevent KEYCODE_WAKEUP' > /dev/null
+    target_wake
     preflight
     if [ $NO_WAKE = 0 ]; then
         apply_settings
@@ -1435,12 +1170,7 @@ main() {
     fi
 
     if [ $SMOKE_ONLY = 0 ]; then
-        if [ $INTERACTIVE = 1 ] && [ $LOCAL = 0 ] && [ $NO_WAKE = 0 ]; then
-            say ""
-            say "Now is a good time to turn the picture off: remote Action Menu (or Quick Settings) > Picture off."
-            pause "Press Enter when done..."
-            check_awake "after picture off" || confirm "The TV does not report itself awake. Continue anyway?" n || exit 1
-        fi
+        target_picture_prompt
         main_phase
     fi
 
@@ -1455,7 +1185,7 @@ main() {
     [ $SETTINGS_APPLIED = 1 ] && restore_settings "$SETTINGS_FILE"
     say ""
     say "==== Done ===="
-    [ $LOCAL = 0 ] && say "Press any remote button to turn the picture back on."
+    target_done_message
     say "Summary: $sumfile"
     say ""
     sed -n '/^## Headline/,/^## Verification/p' "$sumfile" | sed '1,2d;$d' >&2
