@@ -22,9 +22,11 @@ private.
 | path | what |
 |---|---|
 | `tools/` | corpus preparation: `sample_bitrate.py`, `cut_clips.py`, `vc1_classify.py`, `scan_fields.py`, `make_refs.sh`, `make_manifest.py`, `validate_mac.sh` |
-| `android/` | `build_android.sh` (cross-build reduced ffmpeg), `tv_bench.sh` (device harness), see `android/README.md` |
+| `android/` | `build_android.sh` (wrapper: variant name to worktree, then `build/`), `tv_bench.sh` (the harness), see `android/README.md` |
+| `build/` | one build script per architecture (`android-armeabi-v7a.sh`, `android-arm64-v8a.sh`, `macos.sh`) and `common.sh` |
+| `lib/` | target implementations sourced by `tv_bench.sh`: `target-adb.sh`, `target-local.sh` |
 | `test/` | `smoke.sh` and `fake-adb/adb`: run the harness with no device |
-| `config/` | `*.example` files; your real config is copied next to them and is git-ignored |
+| `config/` | `*.example` files (including `targets/`); your real config is copied next to them and is git-ignored |
 
 ## Requirements
 
@@ -143,7 +145,7 @@ Optionally check the macOS build against the references on the host first:
 tools/validate_mac.sh android/bin/ffmpeg-threaded-macos results/mac verify
 ```
 
-### 5. Benchmark and verify on a device
+### 5. Benchmark and verify on a target
 
 ```sh
 android/tv_bench.sh -s HOST:5555 --quick
@@ -153,12 +155,70 @@ See `android/README.md` for what the script does to the device, its safety
 features (`--no-wake`, saved and restored device settings, pause file,
 cool-downs, reconnect handling), options and the layout of `results/`.
 
+## Targets
+
+A target is the machine that decodes: an Android device over adb, or this Mac.
+Each is described by a small file `config/targets/<name>.env` and selected with
+`tv_bench.sh --target <name>` (`VC1_TARGETS_DIR` changes the directory). Real
+target files are git-ignored; only generic `*.example` files are committed:
+`config/targets/adb.env.example` and `config/targets/local.env.example`.
+
+| field | meaning |
+|---|---|
+| `TYPE` | `adb` or `local` |
+| `ARCH` | binary architecture, picks `ffmpeg-<variant>-<ARCH>`: `armeabi-v7a`, `arm64-v8a` or `macos` |
+| `BUILD` | the build script for that architecture (`build/android-armeabi-v7a.sh`, ...) |
+| `NOTES` | free text, logged |
+| `SERIAL`, `DEV_DIR` | adb only: serial or `HOST:PORT`; directory on the device (default `/data/local/tmp/vc1bench`) |
+| `WORK_DIR`, `BIN_DIR` | local only: scratch directory for jobs and logs; directory holding the binaries |
+| `NO_WAKE` | `1` never wakes the device or touches its power settings, and implies `--no-wake`. Use it for devices that must not be woken, so the flag cannot be forgotten |
+| `NO_SMOKE`, `COOLDOWN`, `TIMEOUT`, `RECONNECT_TRIES`, `VARIANTS` | defaults for the matching options |
+
+Command-line options override target fields. `-s SERIAL` still works and is an
+ad hoc adb target with no file.
+
+- **adb**: clips and binaries are pushed to the device, decodes run detached
+  there, settings are saved and restored (see `android/README.md`).
+- **local**: the binaries run on the host. Clips are read in place from
+  `$CORPUS/clips` (nothing is copied or deleted), the job directory is
+  `WORK_DIR`, and the temperature and clock columns are `na`. Verify and bench
+  use the same commands, thread flags, `--max-frames` handling and CSV columns as
+  adb. Wrap long Mac benchmarks in `lockf` if several people share the machine.
+
+```sh
+cp config/targets/adb.env.example   config/targets/tv.env      # edit SERIAL, ARCH
+cp config/targets/local.env.example config/targets/mac.env
+android/tv_bench.sh --target tv  --quick
+android/tv_bench.sh --target mac --max-frames 540 --threads 1 --runs 3
+```
+
+### Build-script contract
+
+Every `build/<name>.sh` takes `<ffmpeg-worktree-dir> <variant> [outdir]` and
+writes `ffmpeg-<variant>-<arch>` plus `ffmpeg-<variant>-<arch>.commit` to `outdir`
+(default `android/bin`). Prerequisites are in each script's header: the Android
+scripts need `ANDROID_NDK_HOME`, the macOS one needs Xcode's command line tools.
+They share the reduced component set in `build/common.sh`. `android/build_android.sh`
+still resolves variant names to worktrees and calls them.
+
+### Adding a target type (for example ssh)
+
+A type is one file, `lib/target-<type>.sh`, defining the same functions as
+`lib/target-adb.sh` (its header lists the interface): `target_init`,
+`connect_device`, `dsh` (run a shell one-liner), `dpush`/`dpull` (copy files),
+`reconnect`, the settings and power hooks (no-ops if the machine has none), and
+the probes (`target_probe`, `target_cpu_probe`, `target_device_info`,
+`target_job_tools`). Then use `TYPE=<type>` in a target file. An ssh type would
+implement `dsh` with `ssh`, `dpush`/`dpull` with `scp` or `rsync`, and use
+`/tmp` as the clip directory. Only `adb` and `local` are implemented here.
+
 ## Testing the harness without a device
 
 ```sh
 test/smoke.sh
 ```
 
-runs `android/tv_bench.sh --dry-run` and a complete run against `test/fake-adb`
-using stub binaries and a synthetic corpus. It needs no clips and no device and
+runs `android/tv_bench.sh --dry-run`, a complete run against `test/fake-adb`
+(ad hoc `-s` and a target file with `NO_WAKE=1`) and a complete run of a `local`
+target, using stub binaries and a synthetic corpus. It needs no clips and no device and
 checks the harness logic only, not any decoder.
